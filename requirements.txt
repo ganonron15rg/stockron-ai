@@ -5,4 +5,4 @@ gspread
 google-auth
 yfinance
 requests
-openai
+openai==1.3.5
