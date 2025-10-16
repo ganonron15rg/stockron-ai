@@ -1,7 +1,7 @@
 from fastapi import FastAPI
 import openai
+import os
 import pandas as pd
-
 app = FastAPI()
 
 @app.get("/")
