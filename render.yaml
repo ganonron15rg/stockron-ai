@@ -1,12 +1,9 @@
 services:
   - type: web
-    name: stockron-ai-server
+    name: stockron-ai
     env: python
-    plan: free
     buildCommand: pip install -r requirements.txt
-    startCommand: uvicorn ai_analyzer_server:app --host 0.0.0.0 --port 10000
+    startCommand: uvicorn ai_analyzer_server:app --host 0.0.0.0 --port $PORT
     envVars:
-      - key: OPENAI_API_KEY
-        sync: false
-      - key: GOOGLE_APPLICATION_CREDENTIALS
-        value: /app/credentials.json
+      - key: PORT
+        value: 8000
