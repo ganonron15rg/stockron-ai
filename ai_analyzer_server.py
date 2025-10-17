@@ -1,12 +1,15 @@
 from fastapi import FastAPI
+from pydantic import BaseModel
 import openai
 import os
 import pandas as pd
+
 app = FastAPI()
 
 @app.get("/")
 def root():
     return {"status": "ok", "message": "AI Analyzer server is running"}
+
 # ===================== הגדרות =====================
 SHEET_ID = "1YTrPFfnpjaJN6r779kYrGxfVSa2zNXCH_RrfLYmSHMM"
 CREDENTIALS_FILE = "credentials.json"
