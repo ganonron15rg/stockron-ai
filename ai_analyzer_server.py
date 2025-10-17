@@ -8,8 +8,7 @@ app = FastAPI()
 
 @app.get("/")
 def root():
-    return {"status": "ok", "message": "AI Analyzer server is running"}
-
+    return {"status": "ok", "message": "AI Analyzer server is running 🎯"
 # ===================== הגדרות =====================
 SHEET_ID = "1YTrPFfnpjaJN6r779kYrGxfVSa2zNXCH_RrfLYmSHMM"
 CREDENTIALS_FILE = "credentials.json"
