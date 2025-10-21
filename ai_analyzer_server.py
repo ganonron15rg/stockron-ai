@@ -1,90 +1,195 @@
-# ========== ai_analyzer_server.py ==========
-from fastapi import FastAPI, HTTPException
-from pydantic import BaseModel
-from openai import OpenAI
-import yfinance as yf
 import os
+import json
+from typing import Optional, List, Literal
 
-# === הגדרות OpenAI ===
-client = OpenAI(api_key=os.getenv("OPENAI_API_KEY"))
+from fastapi import FastAPI, HTTPException
+from fastapi.middleware.cors import CORSMiddleware
+from pydantic import BaseModel, Field, constr
+from openai import OpenAI
 
-# === אפליקציית FastAPI ===
-app = FastAPI(title="Stockron AI Analyzer", version="2.0")
+# ---------- Config ----------
+OPENAI_API_KEY = os.getenv("OPENAI_API_KEY")
+if not OPENAI_API_KEY:
+    raise RuntimeError("Missing OPENAI_API_KEY env var.")
 
-# === בדיקת חיבור בסיסית ===
-@app.get("/")
-def root():
-    return {"status": "ok", "message": "AI Analyzer server is running 🎯"}
+MODEL_NAME = os.getenv("OPENAI_MODEL", "gpt-4.1-mini")
 
-# === מודל הבקשה ===
+client = OpenAI(api_key=OPENAI_API_KEY)
+
+# ---------- FastAPI ----------
+app = FastAPI(
+    title="AI Analyzer Server",
+    version="1.0.0",
+    description="Simple, stable FastAPI wrapper using OpenAI Responses API (OpenAI() client).",
+)
+
+# CORS (adjust origins for production if you want)
+app.add_middleware(
+    CORSMiddleware,
+    allow_origins=os.getenv("CORS_ALLOW_ORIGINS", "*").split(","),
+    allow_credentials=True,
+    allow_methods=["*"],
+    allow_headers=["*"],
+)
+
+
+# ---------- Models ----------
+Timeframe = Literal["1d", "5d", "1mo", "3mo", "6mo", "1y", "2y", "5y", "ytd", "max"]
+
 class AnalyzeRequest(BaseModel):
-    ticker: str
+    ticker: constr(strip_whitespace=True, min_length=1) = Field(..., description="Ticker symbol, e.g., NVDA")
+    timeframe: Timeframe = Field("6mo", description="Historical window for context (not fetched here)")
+    dsl: Optional[str] = Field(None, description="Optional strategy DSL to evaluate")
+    notes: Optional[str] = Field(None, description="Free-text hints/context you want the model to consider")
 
-# === פונקציה שמביאה נתונים מ-Yahoo Finance ===
-def get_stock_data(ticker: str):
-    try:
-        stock = yf.Ticker(ticker)
-        info = stock.info
-        return {
-            "Symbol": ticker.upper(),
-            "Name": info.get("shortName"),
-            "Sector": info.get("sector"),
-            "Market Cap": info.get("marketCap"),
-            "P/E Ratio": info.get("trailingPE"),
-            "Price": info.get("currentPrice") or info.get("regularMarketPrice"),
-            "EPS": info.get("trailingEps"),
-            "PEG Ratio": info.get("pegRatio"),
-            "Dividend Yield": info.get("dividendYield"),
-            "Beta": info.get("beta"),
-        }
-    except Exception as e:
-        raise HTTPException(status_code=400, detail=f"Error fetching data: {e}")
 
-# === פונקציה לניתוח עם GPT ===
-def analyze_with_gpt(data: dict):
-    prompt = f"""
-    נתח את המניה הבאה לפי הנתונים הפונדמנטליים:
-    {data}
+class AnalyzerSignal(BaseModel):
+    name: str
+    description: str
+    verdict: Literal["buy", "hold", "sell", "neutral"]
+    confidence: float = Field(ge=0.0, le=1.0)
 
-    כתוב ניתוח קצר בעברית:
-    - תמחור (גבוה / סביר / נמוך)
-    - קצב צמיחה
-    - סיכון כללי
-    - פוטנציאל לטווח קצר וארוך
+
+class AnalyzeResponse(BaseModel):
+    name: str
+    sector: Optional[str] = None
+    composite_score: float = Field(ge=0, le=100, description="0-100")
+    pe_ratio: Optional[float] = None
+    market_cap_billions: Optional[float] = None
+    current_price: Optional[float] = None
+    change_percent: Optional[float] = None
+    volume: Optional[int] = None
+
+    last_analyzed: str
+    summary: str
+
+    # DSL
+    dsl_signals: Optional[List[AnalyzerSignal]] = None
+    dsl_error: Optional[str] = None
+
+    # Render-friendly blobs
+    chart_base64: Optional[str] = None  # Keep field for compatibility (can be filled elsewhere)
+
+
+# ---------- Helpers ----------
+def build_json_schema_for_response():
     """
+    Use OpenAI Responses JSON schema to enforce a clean shape from the model.
+    """
+    # Convert our Pydantic schema to JSON Schema
+    schema = AnalyzeResponse.model_json_schema()
+    # OpenAI requires a top-level "name" and "schema" with "strict": True preferred
+    return {
+        "name": "analyze_response",
+        "strict": True,
+        "schema": schema,
+    }
 
-    response = client.chat.completions.create(
-        model="gpt-4o-mini",
-        messages=[
-            {"role": "system", "content": "אתה אנליסט שוק ההון מומחה."},
-            {"role": "user", "content": prompt}
-        ],
-        temperature=0.7
+
+SYSTEM_PROMPT = """You are a precise, cautious financial analysis assistant.
+- ALWAYS return valid JSON that matches the provided JSON schema.
+- If you are not certain about real-time numeric values (price, volume, market cap), leave them null.
+- You do NOT fetch live data; focus on qualitative analysis, risk factors, catalysts, competition, moat, and valuation frameworks.
+- If a DSL strategy is provided, interpret it sensibly and emit structured 'dsl_signals' (or a concise 'dsl_error').
+- Be conservative: do not hallucinate exact numbers.
+- Keep the 'summary' factual, concise, and helpful for an investor.
+"""
+
+
+def build_user_prompt(req: AnalyzeRequest) -> str:
+    lines = [
+        f"Ticker: {req.ticker}",
+        f"Timeframe: {req.timeframe}",
+        f"DSL: {req.dsl or '(none)'}",
+    ]
+    if req.notes:
+        lines.append(f"Notes: {req.notes}")
+    lines.append(
+        "\nReturn ONLY the JSON object as per schema. If a field is unknown, use null. "
+        "Do not invent exact prices or volumes."
     )
+    return "\n".join(lines)
 
-    return response.choices[0].message.content.strip()
 
-# === הנתיב הראשי לניתוח מניה ===
-@app.post("/analyze")
-def analyze_stock(request: AnalyzeRequest):
-    data = get_stock_data(request.ticker)
-    analysis = analyze_with_gpt(data)
-    return {"data": data, "ai_analysis": analysis}
+# ---------- Routes ----------
+@app.get("/", tags=["meta"])
+def index():
+    return {
+        "name": "AI Analyzer Server",
+        "status": "ok",
+        "endpoints": {
+            "POST /analyze": {
+                "body": {
+                    "ticker": "NVDA",
+                    "timeframe": "6mo",
+                    "dsl": "SMA(10) cross SMA(50) and RSI<70",
+                    "notes": "Focus on AI catalysts."
+                }
+            },
+            "GET /healthz": {}
+        },
+        "notes": "Call POST /analyze. GET on /analyze will return 405 (Method Not Allowed).",
+        "sdk": "OpenAI Responses API via OpenAI() client",
+        "model": MODEL_NAME,
+    }
 
-# === אופציונלי: ניתוח רשימת מניות ===
-class AnalyzeListRequest(BaseModel):
-    tickers: list[str]
 
-@app.post("/analyze_list")
-def analyze_multiple(request: AnalyzeListRequest):
-    results = []
-    for t in request.tickers:
+@app.get("/healthz", tags=["meta"])
+def healthz():
+    return {"ok": True}
+
+
+@app.post("/analyze", response_model=AnalyzeResponse, tags=["analyze"])
+def analyze(req: AnalyzeRequest):
+    """
+    Main analysis endpoint.
+    Uses OpenAI Responses API with JSON Schema to guarantee clean JSON output.
+    """
+    try:
+        schema = build_json_schema_for_response()
+
+        response = client.responses.create(
+            model=MODEL_NAME,
+            # Enforce JSON schema output (Responses API)
+            response_format={
+                "type": "json_schema",
+                "json_schema": schema,
+            },
+            # System + user prompts (Responses API prefers "input" content)
+            input=[
+                {
+                    "role": "system",
+                    "content": SYSTEM_PROMPT,
+                },
+                {
+                    "role": "user",
+                    "content": build_user_prompt(req),
+                },
+            ],
+        )
+
+        # Extract the JSON text from the first output
+        content = response.output_text  # Convenient helper for Responses API
+        if not content:
+            raise HTTPException(status_code=502, detail="Empty response from model.")
+
         try:
-            data = get_stock_data(t)
-            analysis = analyze_with_gpt(data)
-            results.append({"symbol": t, "data": data, "analysis": analysis})
-        except Exception as e:
-            results.append({"symbol": t, "error": str(e)})
-    return {"results": results}
+            parsed = json.loads(content)
+        except json.JSONDecodeError as e:
+            raise HTTPException(status_code=502, detail=f"Model returned invalid JSON: {e}")
 
-# ========== סוף הקובץ ==========
+        # Validate with Pydantic (gives us nice 422s if off)
+        validated = AnalyzeResponse.model_validate(parsed)
+        return validated
+
+    except HTTPException:
+        raise
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=str(e))
+
+
+# ---------- Dev entry ----------
+if __name__ == "__main__":
+    # For local runs: uvicorn ai_analyzer_server:app --reload
+    import uvicorn
+    uvicorn.run(app, host="0.0.0.0", port=int(os.getenv("PORT", "8000")))
